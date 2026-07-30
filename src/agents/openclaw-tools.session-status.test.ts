@@ -23,6 +23,12 @@ const loadSessionStoreMock = vi.fn();
 const updateSessionStoreMock = vi.fn();
 const callGatewayMock = vi.fn();
 const agentToolGatewayCallMock = vi.fn();
+const readAcpSessionMetaForEntryMock = vi.hoisted(() =>
+  vi.fn((_params?: { sessionKey: string; entry?: SessionEntry }) => undefined as unknown),
+);
+const resolveProviderThinkingProfileMock = vi.hoisted(() =>
+  vi.fn((_params?: { context?: { agentRuntime?: string } }) => undefined as unknown),
+);
 const buildStatusMessageMock = vi.hoisted(() =>
   vi.fn((_params?: unknown) => "OpenClaw\n🧠 Model: GPT-5.4"),
 );
@@ -225,6 +231,13 @@ function createModelCatalogModuleMock() {
         reasoning: true,
         contextWindow: 400000,
       },
+      {
+        provider: "openai",
+        id: "no-think",
+        name: "No Think",
+        reasoning: false,
+        contextWindow: 128000,
+      },
     ],
   };
 }
@@ -327,6 +340,9 @@ function createCommandsStatusRuntimeModuleMock() {
 vi.mock("../config/sessions.js", createSessionsModuleMock);
 vi.mock("../gateway/call.js", createGatewayCallModuleMock);
 vi.mock("./tools/in-process-gateway.js", createInProcessGatewayModuleMock);
+vi.mock("../acp/runtime/session-meta.js", () => ({
+  readAcpSessionMetaForEntry: readAcpSessionMetaForEntryMock,
+}));
 vi.mock("../config/config.js", createConfigModuleMock);
 vi.mock("../agents/prepared-model-catalog.js", createModelCatalogModuleMock);
 vi.mock("../agents/provider-model-normalization.runtime.js", () => ({
@@ -344,7 +360,7 @@ vi.mock("../plugins/plugin-metadata-snapshot.js", async (importOriginal) => ({
 vi.mock("../plugins/provider-thinking.js", () => ({
   resolveProviderBinaryThinking: () => undefined,
   resolveProviderDefaultThinkingLevel: () => undefined,
-  resolveEffectiveThinkingProfile: () => undefined,
+  resolveEffectiveThinkingProfile: resolveProviderThinkingProfileMock,
   resolveProviderXHighThinking: () => undefined,
 }));
 // Keep provider-runtime/plugin activation out of this focused tool test. The
@@ -421,6 +437,10 @@ function resetSessionStore(inputStore: Record<string, SessionEntry>) {
   resolveEnvApiKeyMock.mockReturnValue(null);
   resolveUsableCustomProviderApiKeyMock.mockReset();
   resolveUsableCustomProviderApiKeyMock.mockReturnValue(null);
+  readAcpSessionMetaForEntryMock.mockReset();
+  readAcpSessionMetaForEntryMock.mockReturnValue(undefined);
+  resolveProviderThinkingProfileMock.mockReset();
+  resolveProviderThinkingProfileMock.mockReturnValue(undefined);
   loadSessionStoreMock.mockClear();
   updateSessionStoreMock.mockClear();
   callGatewayMock.mockClear();
@@ -624,6 +644,8 @@ describe("session_status tool", () => {
     expect(details.statusText).toContain("🧠 Model:");
     expect(details.statusText).not.toContain("OAuth/token status");
     expect(tool.outputSchema).toBeDefined();
+    expect(Value.Check(tool.parameters, { thinkingLevel: "high" })).toBe(true);
+    expect(tool.description).toContain("`thinkingLevel` sets thinking");
     expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
     expect(mockCallArg(buildStatusMessageMock)).toMatchObject({
       thinkingCatalog: expect.arrayContaining([
@@ -1648,6 +1670,212 @@ describe("session_status tool", () => {
     });
   });
 
+  it("persists a canonical thinking-only update and fires session:patch", async () => {
+    const events: InternalHookEvent[] = [];
+    registerInternalHook("session:patch", async (event) => {
+      events.push(event);
+    });
+    resetSessionStore({
+      main: {
+        sessionId: "s-thinking",
+        updatedAt: 10,
+        thinkingLevel: "low",
+        modelFallback: {
+          prevModel: "gpt-5.4",
+          prevProvider: "openai",
+          prevThinkingLevel: "low",
+          ts: 1,
+          source: "agent-patch",
+        },
+      },
+    });
+
+    const result = await getSessionStatusTool().execute("call-session-status-thinking", {
+      thinkingLevel: "med",
+    });
+
+    expect(result.details).toMatchObject({
+      ok: true,
+      changedModel: false,
+      thinkingLevel: "medium",
+    });
+    const savedStore = latestMockCallArg(updateSessionStoreMock, 1) as Record<string, SessionEntry>;
+    expect(savedStore.main?.thinkingLevel).toBe("medium");
+    expect(savedStore.main?.modelFallback).toEqual({
+      prevModel: "gpt-5.4",
+      prevProvider: "openai",
+      prevThinkingLevel: "medium",
+      ts: 1,
+      source: "agent-patch",
+    });
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    const event = expectDefined(events[0], "events[0] test invariant");
+    expect(event.context.patch).toEqual({
+      key: "main",
+      thinkingLevel: "medium",
+    });
+    expect(event.context.sessionEntry).toMatchObject({ thinkingLevel: "medium" });
+  });
+
+  it("validates combined model and thinking updates against the new model", async () => {
+    const events: InternalHookEvent[] = [];
+    registerInternalHook("session:patch", async (event) => {
+      events.push(event);
+    });
+    resetSessionStore({
+      main: {
+        sessionId: "s-model-thinking",
+        updatedAt: 10,
+        providerOverride: "openai",
+        modelOverride: "no-think",
+        thinkingLevel: "off",
+      },
+    });
+
+    const result = await getSessionStatusTool().execute("call-session-status-model-thinking", {
+      model: "openai/gpt-5.4",
+      thinkingLevel: "high",
+    });
+
+    expect(result.details).toMatchObject({
+      ok: true,
+      changedModel: true,
+      model: "gpt-5.4",
+      modelProvider: "openai",
+      modelOverride: null,
+      thinkingLevel: "high",
+    });
+    const savedStore = latestMockCallArg(updateSessionStoreMock, 1) as Record<string, SessionEntry>;
+    expect(savedStore.main).toMatchObject({
+      thinkingLevel: "high",
+      liveModelSwitchPending: true,
+    });
+    expect(savedStore.main?.providerOverride).toBeUndefined();
+    expect(savedStore.main?.modelOverride).toBeUndefined();
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]?.context.patch).toEqual({
+      key: "main",
+      model: "openai/gpt-5.4",
+      thinkingLevel: "high",
+    });
+  });
+
+  it("rejects unsupported thinking for the new model without partial persistence", async () => {
+    const events: InternalHookEvent[] = [];
+    registerInternalHook("session:patch", async (event) => {
+      events.push(event);
+    });
+    const store: Record<string, SessionEntry> = {
+      main: {
+        sessionId: "s-invalid-thinking",
+        updatedAt: 10,
+        providerOverride: "anthropic",
+        modelOverride: "claude-sonnet-4-6",
+        thinkingLevel: "low",
+      },
+    };
+    resetSessionStore(store);
+
+    await expect(
+      getSessionStatusTool().execute("call-session-status-invalid-thinking", {
+        model: "openai/no-think",
+        thinkingLevel: "high",
+      }),
+    ).rejects.toThrow(
+      'Thinking level "high" is not supported for openai/no-think. Use one of: off.',
+    );
+
+    expect(updateSessionStoreMock).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+    expect(store.main).toMatchObject({
+      providerOverride: "anthropic",
+      modelOverride: "claude-sonnet-4-6",
+      thinkingLevel: "low",
+    });
+  });
+
+  it("uses ACP backend metadata to accept thinking unsupported by the ordinary runtime", async () => {
+    resetSessionStore({
+      main: {
+        sessionId: "s-acp-thinking-accept",
+        updatedAt: 10,
+        agentRuntimeOverride: "codex",
+      },
+    });
+    // resetSessionStore restores default mocks; install the ACP policy afterward.
+    resolveProviderThinkingProfileMock.mockImplementation(({ context }) => ({
+      levels: [
+        { id: "off" },
+        { id: "max" },
+        ...(context?.agentRuntime === "openclaw" ? [{ id: "ultra" }] : []),
+      ],
+    }));
+    readAcpSessionMetaForEntryMock.mockReturnValue({
+      backend: "openclaw",
+      agent: "main",
+      runtimeSessionName: "main",
+      mode: "persistent",
+      state: "idle",
+      lastActivityAt: 1,
+    });
+    mockConfig = {
+      agents: { defaults: { model: { primary: "openai/gpt-5.6-luna" } } },
+    };
+
+    const result = await getSessionStatusTool().execute("call-acp-thinking-accept", {
+      thinkingLevel: "ultra",
+    });
+
+    expect(result.details).toMatchObject({ thinkingLevel: "ultra" });
+    expect(readAcpSessionMetaForEntryMock).toHaveBeenCalledTimes(2);
+    expect(readAcpSessionMetaForEntryMock).toHaveBeenLastCalledWith({
+      sessionKey: "main",
+      entry: expect.objectContaining({
+        sessionId: "s-acp-thinking-accept",
+        agentRuntimeOverride: "codex",
+      }),
+    });
+  });
+
+  it("uses ACP backend metadata to reject thinking supported by the ordinary runtime", async () => {
+    resetSessionStore({
+      main: {
+        sessionId: "s-acp-thinking-reject",
+        updatedAt: 10,
+        agentRuntimeOverride: "openclaw",
+      },
+    });
+    resolveProviderThinkingProfileMock.mockImplementation(({ context }) => ({
+      levels: [
+        { id: "off" },
+        { id: "max" },
+        ...(context?.agentRuntime === "openclaw" ? [{ id: "ultra" }] : []),
+      ],
+    }));
+    readAcpSessionMetaForEntryMock.mockReturnValue({
+      backend: "codex",
+      agent: "main",
+      runtimeSessionName: "main",
+      mode: "persistent",
+      state: "idle",
+      lastActivityAt: 1,
+    });
+    mockConfig = {
+      agents: { defaults: { model: { primary: "openai/gpt-5.6-luna" } } },
+    };
+
+    await expect(
+      getSessionStatusTool().execute("call-acp-thinking-reject", {
+        thinkingLevel: "ultra",
+      }),
+    ).rejects.toThrow(
+      'Thinking level "ultra" is not supported for openai/gpt-5.6-luna. Use one of: off, max.',
+    );
+
+    expect(updateSessionStoreMock).not.toHaveBeenCalled();
+    expect(readAcpSessionMetaForEntryMock).toHaveBeenCalledOnce();
+  });
+
   it("rejects model changes for model-locked sessions", async () => {
     const store: Record<string, SessionEntry> = {
       main: {
@@ -2354,7 +2582,7 @@ describe("session_status tool", () => {
     await expect(
       tool.execute("call-tree-visibility", {
         sessionKey: "agent:main:main",
-        model: "default",
+        thinkingLevel: "high",
       }),
     ).rejects.toThrow(
       "Session status visibility is restricted to the current session tree (tools.sessions.visibility=tree).",

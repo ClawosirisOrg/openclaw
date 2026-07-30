@@ -6,12 +6,20 @@
 import { randomUUID } from "node:crypto";
 import { readStringValue } from "@openclaw/normalization-core/string-coerce";
 import { Type } from "typebox";
+import { readAcpSessionMetaForEntry } from "../../acp/runtime/session-meta.js";
 import type {
   ElevatedLevel,
   ReasoningLevel,
   ThinkLevel,
+  ThinkingCatalogEntry,
   VerboseLevel,
 } from "../../auto-reply/thinking.js";
+import {
+  formatThinkingLevels,
+  isThinkingLevelSupported,
+  normalizeThinkLevel,
+} from "../../auto-reply/thinking.js";
+import { getRuntimeConfig } from "../../config/config.js";
 import {
   patchSessionEntryWithKey,
   resolveSessionStorePathCore,
@@ -68,7 +76,8 @@ import {
 } from "../model-selection.js";
 import { createModelVisibilityPolicy } from "../model-visibility-policy.js";
 import { loadPublishedPreparedModelCatalog } from "../prepared-model-catalog.js";
-import { resolveSessionModelIdentityRef } from "../session-model-ref.js";
+import { resolveSessionModelIdentityRef, resolveSessionModelRef } from "../session-model-ref.js";
+import { resolveEffectiveAgentRuntime } from "../thinking-runtime.js";
 import {
   describeSessionStatusTool,
   SESSION_STATUS_TOOL_DISPLAY_SUMMARY,
@@ -106,6 +115,9 @@ import {
 const SessionStatusToolSchema = Type.Object({
   sessionKey: Type.Optional(Type.String()),
   model: Type.Optional(Type.String()),
+  thinkingLevel: Type.Optional(
+    Type.String({ description: "Thinking level override for the effective session model" }),
+  ),
   changesSince: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
@@ -175,6 +187,7 @@ const SessionStatusOutputSchema = Type.Object(
     model: Type.Optional(Type.String()),
     modelProvider: Type.Optional(Type.String()),
     modelOverride: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    thinkingLevel: Type.Optional(Type.String()),
     origin: Type.Optional(SessionStatusOriginSchema),
     active: Type.Optional(SessionStatusDeliveryContextSchema),
     deliveryContext: Type.Optional(SessionStatusDeliveryContextSchema),
@@ -564,6 +577,63 @@ async function resolveModelOverride(params: {
     model: resolved.ref.model,
     isDefault,
   };
+}
+
+function resolveValidatedThinkingLevel(params: {
+  raw: string;
+  cfg: OpenClawConfig;
+  entry: SessionEntry;
+  agentId: string;
+  sessionKey: string;
+  catalog: ThinkingCatalogEntry[];
+  activeModelIdentity?: ActiveStatusModelIdentity;
+}): ThinkLevel {
+  const persistedModel = resolveSessionModelRef(params.cfg, params.entry, params.agentId);
+  const selected = params.activeModelIdentity
+    ? {
+        provider: params.activeModelIdentity.provider ?? persistedModel.provider,
+        model: params.activeModelIdentity.model,
+      }
+    : persistedModel;
+  const level = normalizeThinkLevel(params.raw);
+  // ACP metadata can own canonical agent keys, so its backend must override
+  // key/config-derived runtime policy when validating thinking.
+  const acpMeta = readAcpSessionMetaForEntry({
+    sessionKey: params.sessionKey,
+    entry: params.entry,
+  });
+  const agentRuntime =
+    acpMeta?.backend ??
+    resolveEffectiveAgentRuntime({
+      cfg: params.cfg,
+      provider: selected.provider,
+      modelId: selected.model,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      sessionEntry: params.entry,
+    });
+  const hint = formatThinkingLevels(
+    selected.provider,
+    selected.model,
+    ", ",
+    params.catalog,
+    agentRuntime,
+  );
+  if (
+    !level ||
+    !isThinkingLevelSupported({
+      provider: selected.provider,
+      model: selected.model,
+      level,
+      catalog: params.catalog,
+      agentRuntime,
+    })
+  ) {
+    throw new Error(
+      `Thinking level "${params.raw}" is not supported for ${selected.provider}/${selected.model}. Use one of: ${hint}.`,
+    );
+  }
+  return level;
 }
 
 export function createSessionStatusTool(opts?: {
@@ -969,7 +1039,33 @@ export function createSessionStatusTool(opts?: {
           const selectedAgentDir = resolveAgentDir(cfg, agentId);
           const selectedWorkspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
           const modelRaw = readToolStringParam(params, "model");
-          let changedModel = false;
+          const thinkingLevelRaw = readToolStringParam(params, "thinkingLevel");
+          const isImplicitCurrentRequest = requestedKeyParam === undefined;
+          const liveSessionKeys = [
+            opts?.runSessionKey,
+            storeScopedRequesterKey,
+            effectiveRequesterKey,
+            visibilityRequesterKey,
+          ];
+          const activeModelIdentity = resolveActiveStatusModelIdentity({
+            activeModelId: opts?.activeModelId?.trim(),
+            activeModelProvider: opts?.activeModelProvider?.trim(),
+            isImplicitCurrentRequest,
+            isSemanticCurrentRequest,
+            liveSessionKeys,
+            modelRaw,
+            resolvedKey: scopedResolved.key,
+            resolvedAgentId: agentId,
+            requesterAgentId,
+          });
+          let modelSelection:
+            | {
+                provider: string;
+                model: string;
+                isDefault: boolean;
+              }
+            | undefined;
+          let modelPatchValue: string | null | undefined;
           if (typeof modelRaw === "string") {
             const selection = await resolveModelOverride({
               cfg,
@@ -980,7 +1076,7 @@ export function createSessionStatusTool(opts?: {
               workspaceDir: selectedWorkspaceDir,
               metadataSnapshot: opts?.metadataSnapshot,
             });
-            const modelSelection =
+            modelSelection =
               selection.kind === "reset"
                 ? {
                     provider: configured.provider,
@@ -992,97 +1088,140 @@ export function createSessionStatusTool(opts?: {
                     model: selection.model,
                     isDefault: selection.isDefault,
                   };
-            const nextEntry: SessionEntry = { ...scopedResolved.entry };
-            const currentProvider =
-              scopedResolved.entry.providerOverride?.trim() ||
-              scopedResolved.entry.modelProvider?.trim() ||
-              configured.provider;
-            const applied = applyModelOverrideWithAuthProfileCompatibility({
+            modelPatchValue =
+              selection.kind === "reset" ? null : `${selection.provider}/${selection.model}`;
+          }
+
+          let mutationThinkingCatalog: ThinkingCatalogEntry[] | undefined;
+          const loadMutationThinkingCatalog = async () => {
+            mutationThinkingCatalog ??= await loadPublishedPreparedModelCatalog({
+              config: cfg,
+              agentId,
+              agentDir: selectedAgentDir,
+              readOnly: true,
+              ...(scopedResolved.entry.spawnedWorkspaceDir
+                ? { workspaceDir: scopedResolved.entry.spawnedWorkspaceDir }
+                : {}),
+            });
+            return mutationThinkingCatalog;
+          };
+
+          const prospectiveEntry: SessionEntry = { ...scopedResolved.entry };
+          let changedModel = false;
+          let changedThinking = false;
+          if (modelSelection) {
+            changedModel = applyModelOverrideWithAuthProfileCompatibility({
               cfg,
               agentDir: selectedAgentDir,
-              entry: nextEntry,
-              currentProvider,
+              entry: prospectiveEntry,
+              currentProvider:
+                prospectiveEntry.providerOverride?.trim() ||
+                prospectiveEntry.modelProvider?.trim() ||
+                configured.provider,
               selection: modelSelection,
               explicitDefaultSelection: modelSelection.isDefault,
               markLiveSwitchPending: true,
+            }).updated;
+          }
+          if (thinkingLevelRaw !== undefined) {
+            const thinkingLevel = resolveValidatedThinkingLevel({
+              raw: thinkingLevelRaw,
+              cfg,
+              entry: prospectiveEntry,
+              agentId,
+              sessionKey: scopedResolved.key,
+              catalog: await loadMutationThinkingCatalog(),
+              activeModelIdentity: modelSelection ? undefined : activeModelIdentity,
             });
-            if (applied.updated) {
-              const patchResult = await patchSessionEntryWithKey(
-                {
-                  agentId,
-                  sessionKey: scopedResolved.key,
-                  storePath,
-                },
-                (entry, context) => {
-                  const persistedEntryPatch: SessionEntry = { ...entry };
-                  applyModelOverrideWithAuthProfileCompatibility({
+            changedThinking = prospectiveEntry.thinkingLevel !== thinkingLevel;
+            prospectiveEntry.thinkingLevel = thinkingLevel;
+          }
+
+          if (changedModel || changedThinking) {
+            const patchResult = await patchSessionEntryWithKey(
+              {
+                agentId,
+                sessionKey: scopedResolved.key,
+                storePath,
+              },
+              async (entry, context) => {
+                const persistedEntryPatch: SessionEntry = { ...entry };
+                changedModel = modelSelection
+                  ? applyModelOverrideWithAuthProfileCompatibility({
+                      cfg,
+                      agentDir: selectedAgentDir,
+                      entry: persistedEntryPatch,
+                      currentProvider:
+                        entry.providerOverride?.trim() ||
+                        entry.modelProvider?.trim() ||
+                        configured.provider,
+                      selection: modelSelection,
+                      explicitDefaultSelection: modelSelection.isDefault,
+                      markLiveSwitchPending: true,
+                    }).updated
+                  : false;
+                if (thinkingLevelRaw !== undefined) {
+                  const thinkingLevel = resolveValidatedThinkingLevel({
+                    raw: thinkingLevelRaw,
                     cfg,
-                    agentDir: selectedAgentDir,
                     entry: persistedEntryPatch,
-                    currentProvider:
-                      entry.providerOverride?.trim() ||
-                      entry.modelProvider?.trim() ||
-                      configured.provider,
-                    selection: modelSelection,
-                    explicitDefaultSelection: modelSelection.isDefault,
-                    markLiveSwitchPending: true,
+                    agentId,
+                    sessionKey: scopedResolved.key,
+                    catalog: await loadMutationThinkingCatalog(),
+                    activeModelIdentity: modelSelection ? undefined : activeModelIdentity,
                   });
-                  if (
-                    !persistedEntryPatch.sessionId.trim() &&
-                    !context.existingEntry?.sessionId?.trim()
-                  ) {
-                    persistedEntryPatch.sessionId = randomUUID();
+                  changedThinking = persistedEntryPatch.thinkingLevel !== thinkingLevel;
+                  persistedEntryPatch.thinkingLevel = thinkingLevel;
+                  if (changedThinking && !changedModel) {
+                    persistedEntryPatch.updatedAt = Date.now();
+                    // Keep a pending agent model-revert marker aligned with an
+                    // independent thinking choice so rollback cannot clobber it.
+                    if (persistedEntryPatch.modelFallback?.source === "agent-patch") {
+                      persistedEntryPatch.modelFallback = {
+                        ...persistedEntryPatch.modelFallback,
+                        prevThinkingLevel: thinkingLevel,
+                      };
+                    }
                   }
-                  return persistedEntryPatch;
-                },
-                {
-                  fallbackEntry: scopedResolved.persisted ? undefined : scopedResolved.entry,
-                  replaceEntry: true,
-                },
-              );
-              if (!patchResult) {
-                throw new Error(`Unknown sessionKey: ${scopedResolved.key}`);
-              }
-              const persistedEntry = patchResult.entry;
-              scopedResolved = {
-                entry: persistedEntry,
-                key: patchResult.sessionKey,
-                persisted: true,
-              };
+                } else {
+                  changedThinking = false;
+                }
+                if (
+                  !persistedEntryPatch.sessionId.trim() &&
+                  !context.existingEntry?.sessionId?.trim()
+                ) {
+                  persistedEntryPatch.sessionId = randomUUID();
+                }
+                return persistedEntryPatch;
+              },
+              {
+                fallbackEntry: scopedResolved.persisted ? undefined : scopedResolved.entry,
+                replaceEntry: true,
+              },
+            );
+            if (!patchResult) {
+              throw new Error(`Unknown sessionKey: ${scopedResolved.key}`);
+            }
+            const persistedEntry = patchResult.entry;
+            scopedResolved = {
+              entry: persistedEntry,
+              key: patchResult.sessionKey,
+              persisted: true,
+            };
+            if (changedModel || changedThinking) {
               triggerSessionPatchHook({
                 cfg,
                 sessionEntry: persistedEntry,
                 sessionKey: patchResult.sessionKey,
                 patch: {
                   key: patchResult.sessionKey,
-                  model:
-                    selection.kind === "reset" ? null : `${selection.provider}/${selection.model}`,
+                  ...(changedModel ? { model: modelPatchValue } : {}),
+                  ...(changedThinking ? { thinkingLevel: persistedEntry.thinkingLevel } : {}),
                 },
               });
-              changedModel = true;
             }
           }
 
-          const activeModelId = opts?.activeModelId?.trim();
-          const activeModelProvider = opts?.activeModelProvider?.trim();
-          const isImplicitCurrentRequest = requestedKeyParam === undefined;
-          const liveSessionKeys = [
-            opts?.runSessionKey,
-            storeScopedRequesterKey,
-            effectiveRequesterKey,
-            visibilityRequesterKey,
-          ];
-          const activeModelIdentity = resolveActiveStatusModelIdentity({
-            activeModelId,
-            activeModelProvider,
-            isImplicitCurrentRequest,
-            isSemanticCurrentRequest,
-            liveSessionKeys,
-            modelRaw,
-            resolvedKey: scopedResolved.key,
-            resolvedAgentId: agentId,
-            requesterAgentId,
-          });
           const runtimeModelIdentity = activeModelIdentity
             ? activeModelIdentity
             : resolveSessionModelIdentityRef(
@@ -1127,15 +1266,17 @@ export function createSessionStatusTool(opts?: {
             config: cfg,
           });
           // Tool status may read persisted/configured facts, but must not start provider discovery.
-          const thinkingCatalog = await loadPublishedPreparedModelCatalog({
-            config: cfg,
-            agentId,
-            agentDir: selectedAgentDir,
-            readOnly: true,
-            ...(statusSessionEntry.spawnedWorkspaceDir
-              ? { workspaceDir: statusSessionEntry.spawnedWorkspaceDir }
-              : {}),
-          });
+          const thinkingCatalog =
+            mutationThinkingCatalog ??
+            (await loadPublishedPreparedModelCatalog({
+              config: cfg,
+              agentId,
+              agentDir: selectedAgentDir,
+              readOnly: true,
+              ...(statusSessionEntry.spawnedWorkspaceDir
+                ? { workspaceDir: statusSessionEntry.spawnedWorkspaceDir }
+                : {}),
+            }));
           const { buildStatusText } = await loadCommandsStatusRuntime();
           const statusText = await buildStatusText({
             cfg,
@@ -1238,6 +1379,9 @@ export function createSessionStatusTool(opts?: {
                       : {}),
                     modelOverride: modelOverrideForResult,
                   }
+                : {}),
+              ...(thinkingLevelRaw !== undefined
+                ? { thinkingLevel: statusSessionEntry.thinkingLevel }
                 : {}),
               statusText: visibleStatusText,
               ...routeDetails,
