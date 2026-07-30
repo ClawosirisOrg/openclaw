@@ -191,7 +191,7 @@ async function fixture(
     retireGateway: () => {
       current = false;
     },
-    execute: (params: { model: string; sessionKey?: string }) =>
+    execute: (params: { model?: string; thinkingLevel?: string; sessionKey?: string }) =>
       withPluginRuntimeGatewayRequestScope(
         { context, resolveGatewayContext, isWebchatConnect: () => false },
         () =>
@@ -255,6 +255,39 @@ it("keeps scoped selections session-only and reports unchanged choices without p
   expect(onPatch).toHaveBeenCalledTimes(2);
   expect(configWrite).not.toHaveBeenCalled();
   expect(cfg).toEqual(configBefore);
+});
+
+it.each([undefined, "chosen"])(
+  "persists thinking without reporting an unchanged model (%s) as changed",
+  async (model) => {
+    const target = await fixture();
+    await target.execute({ model: "chosen" });
+    onPatch.mockClear();
+
+    expect((await target.execute({ model, thinkingLevel: "off" })).details).toMatchObject({
+      changedModel: false,
+      thinkingLevel: "off",
+    });
+    const selected = target.read();
+    expect(selected).toMatchObject({ modelOverride: "chosen", thinkingLevel: "off" });
+    expect(onPatch).toHaveBeenCalledOnce();
+
+    expect((await target.execute({ model, thinkingLevel: "off" })).details).toMatchObject({
+      changedModel: false,
+    });
+    expect(target.read()).toEqual(selected);
+    expect(onPatch).toHaveBeenCalledOnce();
+  },
+);
+
+it("rejects unsupported combined thinking without persisting the model selection", async () => {
+  const target = await fixture();
+  const before = target.read();
+  await expect(target.execute({ model: "chosen", thinkingLevel: "high" })).rejects.toThrow(
+    "not supported",
+  );
+  expect(target.read()).toEqual(before);
+  expect(onPatch).not.toHaveBeenCalled();
 });
 
 it.each(["unavailable", "retired before commit"] as const)(

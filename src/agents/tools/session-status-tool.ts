@@ -87,6 +87,9 @@ import {
 const SessionStatusToolSchema = Type.Object({
   sessionKey: Type.Optional(Type.String()),
   model: Type.Optional(Type.String()),
+  thinkingLevel: Type.Optional(
+    Type.String({ description: "Thinking level override for the effective session model" }),
+  ),
   changesSince: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
@@ -156,6 +159,7 @@ const SessionStatusOutputSchema = Type.Object(
     model: Type.Optional(Type.String()),
     modelProvider: Type.Optional(Type.String()),
     modelOverride: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    thinkingLevel: Type.Optional(Type.String()),
     origin: Type.Optional(SessionStatusOriginSchema),
     active: Type.Optional(SessionStatusDeliveryContextSchema),
     deliveryContext: Type.Optional(SessionStatusDeliveryContextSchema),
@@ -851,23 +855,7 @@ export function createSessionStatusTool(opts?: {
           const selectedAgentDir = resolveAgentDir(cfg, agentId);
           const selectedWorkspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
           const modelRaw = readToolStringParam(params, "model");
-          let changedModel = false;
-          if (typeof modelRaw === "string") {
-            const patched = await patchSessionStatusModel({
-              cfg,
-              agentId,
-              agentDir: selectedAgentDir,
-              workspaceDir: selectedWorkspaceDir,
-              storePath,
-              raw: modelRaw,
-              resolved: scopedResolved,
-              metadataSnapshot: opts?.metadataSnapshot,
-              gatewayCall: gatewayScoped ? gatewayCall : undefined,
-            });
-            scopedResolved = patched.resolved;
-            changedModel = patched.changedModel;
-          }
-
+          const thinkingLevelRaw = readToolStringParam(params, "thinkingLevel");
           const activeModelId = opts?.activeModelId?.trim();
           const activeModelProvider = opts?.activeModelProvider?.trim();
           const isImplicitCurrentRequest = requestedKeyParam === undefined;
@@ -888,6 +876,25 @@ export function createSessionStatusTool(opts?: {
             resolvedAgentId: agentId,
             requesterAgentId,
           });
+          let changedModel = false;
+          if (modelRaw !== undefined || thinkingLevelRaw !== undefined) {
+            const patched = await patchSessionStatusModel({
+              cfg,
+              agentId,
+              agentDir: selectedAgentDir,
+              workspaceDir: selectedWorkspaceDir,
+              storePath,
+              raw: modelRaw,
+              thinkingLevel: thinkingLevelRaw,
+              activeModelIdentity,
+              resolved: scopedResolved,
+              metadataSnapshot: opts?.metadataSnapshot,
+              gatewayCall: gatewayScoped ? gatewayCall : undefined,
+            });
+            scopedResolved = patched.resolved;
+            changedModel = patched.changedModel;
+          }
+
           const runtimeModelIdentity = activeModelIdentity
             ? activeModelIdentity
             : resolveSessionModelIdentityRef(
@@ -1039,6 +1046,9 @@ export function createSessionStatusTool(opts?: {
                       : {}),
                     modelOverride: modelOverrideForResult,
                   }
+                : {}),
+              ...(thinkingLevelRaw !== undefined
+                ? { thinkingLevel: statusSessionEntry.thinkingLevel }
                 : {}),
               statusText: visibleStatusText,
               ...routeDetails,

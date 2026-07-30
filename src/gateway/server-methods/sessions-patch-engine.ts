@@ -547,7 +547,10 @@ export async function executeSessionPatchMutations(params: {
                         if (replacement.replacement) {
                           replacements.push(replacement.replacement);
                         }
-                        projectedOutcomes.push(replacement.outcome);
+                        projectedOutcomes.push({
+                          ...replacement.outcome,
+                          changedModel: projected.changedModel,
+                        });
                       } catch (error) {
                         projectedOutcomes.push({
                           ok: false,
@@ -636,7 +639,13 @@ export async function executeSessionPatchMutations(params: {
                     const outcome = groupOutcomes[groupIndex]!;
                     outcomes[target.index] = outcome;
                     if (outcome.ok) {
-                      recordSessionStatusModelPatchOutcome(outcome.applied);
+                      // Combined status patches must not report thinking-only changes as model changes.
+                      recordSessionStatusModelPatchOutcome(
+                        outcome.applied &&
+                          ("thinkingLevel" in target.fullPatch
+                            ? outcome.changedModel === true
+                            : "model" in target.fullPatch),
+                      );
                     }
                     if (outcome.ok && outcome.applied) {
                       modelSelection.refreshSessionPatchQueuedSelection({

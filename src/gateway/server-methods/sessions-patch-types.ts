@@ -26,6 +26,7 @@ export type MutationOutcome =
   | {
       ok: true;
       applied: boolean;
+      changedModel?: boolean;
       accessChanged: boolean;
       entry: SessionEntry;
     }
