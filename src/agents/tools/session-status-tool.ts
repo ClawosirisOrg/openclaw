@@ -88,7 +88,10 @@ const SessionStatusToolSchema = Type.Object({
   sessionKey: Type.Optional(Type.String()),
   model: Type.Optional(Type.String()),
   thinkingLevel: Type.Optional(
-    Type.String({ description: "Thinking level override for the effective session model" }),
+    Type.String({
+      description:
+        'Thinking level override for the effective session model; use "default" to reset',
+    }),
   ),
   changesSince: Type.Optional(Type.Integer({ minimum: 0 })),
 });
@@ -886,7 +889,6 @@ export function createSessionStatusTool(opts?: {
               storePath,
               raw: modelRaw,
               thinkingLevel: thinkingLevelRaw,
-              activeModelIdentity,
               resolved: scopedResolved,
               metadataSnapshot: opts?.metadataSnapshot,
               gatewayCall: gatewayScoped ? gatewayCall : undefined,
@@ -1047,7 +1049,7 @@ export function createSessionStatusTool(opts?: {
                     modelOverride: modelOverrideForResult,
                   }
                 : {}),
-              ...(thinkingLevelRaw !== undefined
+              ...(thinkingLevelRaw !== undefined && statusSessionEntry.thinkingLevel !== undefined
                 ? { thinkingLevel: statusSessionEntry.thinkingLevel }
                 : {}),
               statusText: visibleStatusText,

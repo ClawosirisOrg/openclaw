@@ -280,6 +280,27 @@ it.each([undefined, "chosen"])(
   },
 );
 
+it("resets thinking through the Gateway without leaving a stale fallback preference", async () => {
+  const target = await fixture({
+    entry: {
+      thinkingLevel: "off",
+      modelFallback: {
+        prevProvider: "fixture",
+        prevModel: "default",
+        prevThinkingLevel: "off",
+        source: "agent-patch",
+        ts: 1,
+      },
+    },
+  });
+  const result = await target.execute({ thinkingLevel: "default" });
+  expect(result.details).toMatchObject({ changedModel: false });
+  expect(result.details).not.toHaveProperty("thinkingLevel");
+  expect(target.read().thinkingLevel).toBeUndefined();
+  expect(target.read().modelFallback?.prevThinkingLevel).toBeUndefined();
+  expect(onPatch).toHaveBeenCalledOnce();
+});
+
 it("rejects unsupported combined thinking without persisting the model selection", async () => {
   const target = await fixture();
   const before = target.read();

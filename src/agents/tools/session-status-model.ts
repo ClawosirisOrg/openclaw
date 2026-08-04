@@ -3,6 +3,7 @@ import { readAcpSessionMetaForEntry } from "../../acp/runtime/session-meta.js";
 import type { ThinkLevel, ThinkingCatalogEntry } from "../../auto-reply/thinking.js";
 import {
   formatThinkingLevels,
+  isSessionDefaultDirectiveValue,
   isThinkingLevelSupported,
   normalizeThinkLevel,
 } from "../../auto-reply/thinking.js";
@@ -139,15 +140,8 @@ function resolveValidatedThinkingLevel(params: {
   agentId: string;
   sessionKey: string;
   catalog: ThinkingCatalogEntry[];
-  activeModelIdentity?: { provider?: string; model: string };
 }): ThinkLevel {
-  const persistedModel = resolveSessionModelRef(params.cfg, params.entry, params.agentId);
-  const selected = params.activeModelIdentity
-    ? {
-        provider: params.activeModelIdentity.provider ?? persistedModel.provider,
-        model: params.activeModelIdentity.model,
-      }
-    : persistedModel;
+  const selected = resolveSessionModelRef(params.cfg, params.entry, params.agentId);
   const level = normalizeThinkLevel(params.raw);
   // ACP metadata can own canonical agent keys, so its backend must override
   // key/config-derived runtime policy when validating thinking.
@@ -198,12 +192,14 @@ export async function patchSessionStatusModel(params: {
   storePath: string;
   raw?: string;
   thinkingLevel?: string;
-  activeModelIdentity?: { provider?: string; model: string };
   resolved: ResolvedStatusSession;
   metadataSnapshot?: PluginMetadataSnapshot;
   gatewayCall?: AgentToolGatewayRequestCaller;
 }): Promise<{ resolved: ResolvedStatusSession; changedModel: boolean }> {
   const { cfg, agentId, resolved } = params;
+  const thinkingLevelRaw = params.thinkingLevel;
+  const resetsThinkingLevel =
+    thinkingLevelRaw !== undefined && isSessionDefaultDirectiveValue(thinkingLevelRaw);
   if (params.gatewayCall) {
     const gatewayCall = params.gatewayCall;
     const { result, applied } = await withSessionStatusModelPatchOrigin(() =>
@@ -223,7 +219,9 @@ export async function patchSessionStatusModel(params: {
           ...(params.raw !== undefined
             ? { model: normalizeToolModelOverride(params.raw) ?? null }
             : {}),
-          ...(params.thinkingLevel !== undefined ? { thinkingLevel: params.thinkingLevel } : {}),
+          ...(thinkingLevelRaw !== undefined
+            ? { thinkingLevel: resetsThinkingLevel ? null : thinkingLevelRaw }
+            : {}),
         },
       }),
     );
@@ -238,8 +236,6 @@ export async function patchSessionStatusModel(params: {
   const selectedWorkspaceDir = params.workspaceDir;
   const storePath = params.storePath;
   const modelRaw = params.raw;
-  const thinkingLevelRaw = params.thinkingLevel;
-  const activeModelIdentity = params.activeModelIdentity;
   let scopedResolved = resolved;
   let modelSelection:
     | {
@@ -275,7 +271,7 @@ export async function patchSessionStatusModel(params: {
   }
 
   const mutationThinkingCatalog =
-    thinkingLevelRaw !== undefined
+    thinkingLevelRaw !== undefined && !resetsThinkingLevel
       ? await loadPublishedPreparedModelCatalog({
           config: cfg,
           agentId,
@@ -305,17 +301,21 @@ export async function patchSessionStatusModel(params: {
     }).updated;
   }
   if (thinkingLevelRaw !== undefined) {
-    const thinkingLevel = resolveValidatedThinkingLevel({
-      raw: thinkingLevelRaw,
-      cfg,
-      entry: prospectiveEntry,
-      agentId,
-      sessionKey: scopedResolved.key,
-      catalog: mutationThinkingCatalog,
-      activeModelIdentity: modelSelection ? undefined : activeModelIdentity,
-    });
-    changedThinking = prospectiveEntry.thinkingLevel !== thinkingLevel;
-    prospectiveEntry.thinkingLevel = thinkingLevel;
+    if (resetsThinkingLevel) {
+      changedThinking = prospectiveEntry.thinkingLevel !== undefined;
+      delete prospectiveEntry.thinkingLevel;
+    } else {
+      const thinkingLevel = resolveValidatedThinkingLevel({
+        raw: thinkingLevelRaw,
+        cfg,
+        entry: prospectiveEntry,
+        agentId,
+        sessionKey: scopedResolved.key,
+        catalog: mutationThinkingCatalog,
+      });
+      changedThinking = prospectiveEntry.thinkingLevel !== thinkingLevel;
+      prospectiveEntry.thinkingLevel = thinkingLevel;
+    }
   }
 
   if (changedModel || changedThinking) {
@@ -342,17 +342,21 @@ export async function patchSessionStatusModel(params: {
             }).updated
           : false;
         if (thinkingLevelRaw !== undefined) {
-          const thinkingLevel = resolveValidatedThinkingLevel({
-            raw: thinkingLevelRaw,
-            cfg,
-            entry: persistedEntryPatch,
-            agentId,
-            sessionKey: scopedResolved.key,
-            catalog: mutationThinkingCatalog,
-            activeModelIdentity: modelSelection ? undefined : activeModelIdentity,
-          });
-          changedThinking = persistedEntryPatch.thinkingLevel !== thinkingLevel;
-          persistedEntryPatch.thinkingLevel = thinkingLevel;
+          if (resetsThinkingLevel) {
+            changedThinking = persistedEntryPatch.thinkingLevel !== undefined;
+            delete persistedEntryPatch.thinkingLevel;
+          } else {
+            const thinkingLevel = resolveValidatedThinkingLevel({
+              raw: thinkingLevelRaw,
+              cfg,
+              entry: persistedEntryPatch,
+              agentId,
+              sessionKey: scopedResolved.key,
+              catalog: mutationThinkingCatalog,
+            });
+            changedThinking = persistedEntryPatch.thinkingLevel !== thinkingLevel;
+            persistedEntryPatch.thinkingLevel = thinkingLevel;
+          }
           if (changedThinking && !changedModel) {
             persistedEntryPatch.updatedAt = Date.now();
             // Keep a pending agent model-revert marker aligned with an
@@ -360,7 +364,7 @@ export async function patchSessionStatusModel(params: {
             if (persistedEntryPatch.modelFallback?.source === "agent-patch") {
               persistedEntryPatch.modelFallback = {
                 ...persistedEntryPatch.modelFallback,
-                prevThinkingLevel: thinkingLevel,
+                prevThinkingLevel: persistedEntryPatch.thinkingLevel,
               };
             }
           }
@@ -394,7 +398,11 @@ export async function patchSessionStatusModel(params: {
         patch: {
           key: patchResult.sessionKey,
           ...(changedModel ? { model: modelPatchValue } : {}),
-          ...(changedThinking ? { thinkingLevel: persistedEntry.thinkingLevel } : {}),
+          ...(changedThinking
+            ? {
+                thinkingLevel: resetsThinkingLevel ? null : persistedEntry.thinkingLevel,
+              }
+            : {}),
         },
       });
     }
