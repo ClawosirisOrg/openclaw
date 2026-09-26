@@ -37,6 +37,7 @@ Selecting a reply target inside a thread preserves both the thread and the selec
 ### Thread inheritance and slash commands
 
 - Inbound threaded messages include the thread root message as extra agent context.
+- In a room with `requireMention: true`, a human-authored thread root that mentions the bot activates that thread. Authorized human replies in that thread do not need to repeat the mention. Unthreaded messages, unrelated threads, bot-authored roots or replies, redacted roots, and roots that cannot be decrypted still require their own mention. OpenClaw re-reads the authoritative thread root from the homeserver instead of keeping process-local activation state, so the behavior remains deterministic across Gateway restarts.
 - Message-tool sends auto-inherit the current Matrix thread when targeting the same room (or the same DM user target), unless an explicit `threadId` is provided.
 - DM user-target reuse only kicks in when current session metadata proves the same DM peer on the same Matrix account; otherwise OpenClaw falls back to normal user-scoped routing.
 - `/session unbind`, `/agents`, `/session idle`, `/session max-age`, and thread-bound `/acp spawn` all work in Matrix rooms and DMs.

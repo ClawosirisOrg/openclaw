@@ -13,7 +13,55 @@ vi.mock("../../runtime.js", () => ({
   }),
 }));
 
-import { resolveMentions } from "./mentions.js";
+import { isHumanAuthoredMentionedMatrixThreadRoot, resolveMentions } from "./mentions.js";
+
+describe("isHumanAuthoredMentionedMatrixThreadRoot", () => {
+  const resolveRoot = (
+    overrides: Record<string, unknown> = {},
+    mentionRegexes: RegExp[] = [/@bot/i],
+  ) =>
+    isHumanAuthoredMentionedMatrixThreadRoot({
+      event: {
+        type: "m.room.message",
+        sender: "@alice:matrix.org",
+        event_id: "$root",
+        content: { msgtype: "m.text", body: "@bot start thread" },
+        ...overrides,
+      } as never,
+      selfUserId: "@bot:matrix.org",
+      configuredBotUserIds: new Set(["@relaybot:matrix.org"]),
+      mentionRegexes,
+    });
+
+  it("accepts a human-authored root with a configured mention", () => {
+    expect(resolveRoot()).toBe(true);
+  });
+
+  it("accepts a human-authored root with a visible native mention", () => {
+    expect(
+      resolveRoot(
+        {
+          content: {
+            msgtype: "m.text",
+            body: "@bot:matrix.org start thread",
+            "m.mentions": { user_ids: ["@bot:matrix.org"] },
+          },
+        },
+        [],
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["the OpenClaw bot", { sender: "@bot:matrix.org" }],
+    ["a configured bot", { sender: "@relaybot:matrix.org" }],
+    ["an undecryptable event", { type: "m.room.encrypted" }],
+    ["a redacted event", { unsigned: { redacted_because: {} } }],
+    ["an unmentioned root", { content: { msgtype: "m.text", body: "start thread" } }],
+  ])("rejects %s as an activating thread root", (_label, overrides) => {
+    expect(resolveRoot(overrides)).toBe(false);
+  });
+});
 
 describe("resolveMentions", () => {
   const userId = "@bot:matrix.org";

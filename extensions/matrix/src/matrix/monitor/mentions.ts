@@ -1,8 +1,11 @@
 import { decodeHtmlEntities } from "openclaw/plugin-sdk/html-entity-runtime";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  asOptionalRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { escapeRegExp } from "openclaw/plugin-sdk/text-utility-runtime";
 import { getMatrixRuntime } from "../../runtime.js";
-import type { RoomMessageEventContent } from "./types.js";
+import { EventType, type RoomMessageEventContent } from "./types.js";
 
 const MATRIX_HTML_ENTITY_RE = /&(?:#x?[0-9a-f]+|amp|apos|gt|lt|nbsp|quot);/gi;
 
@@ -201,6 +204,53 @@ function checkFormattedBodyMention(params: {
     }
   }
   return false;
+}
+
+export function isHumanAuthoredMentionedMatrixThreadRoot(params: {
+  event: Record<string, unknown>;
+  selfUserId: string;
+  configuredBotUserIds: ReadonlySet<string>;
+  displayName?: string | null;
+  mentionRegexes: RegExp[];
+}): boolean {
+  const senderId = typeof params.event.sender === "string" ? params.event.sender.trim() : "";
+  const unsigned = asOptionalRecord(params.event.unsigned);
+  const eventContent = asOptionalRecord(params.event.content);
+  if (
+    params.event.type !== EventType.RoomMessage ||
+    unsigned?.redacted_because ||
+    !eventContent ||
+    !senderId ||
+    senderId === params.selfUserId ||
+    params.configuredBotUserIds.has(senderId)
+  ) {
+    return false;
+  }
+  const rawMentions = asOptionalRecord(eventContent["m.mentions"]);
+  const mentionedUserIds = Array.isArray(rawMentions?.user_ids)
+    ? rawMentions.user_ids.filter((value): value is string => typeof value === "string")
+    : undefined;
+  const content: RoomMessageEventContent = {
+    body: typeof eventContent.body === "string" ? eventContent.body : undefined,
+    formatted_body:
+      typeof eventContent.formatted_body === "string" ? eventContent.formatted_body : undefined,
+    ...(rawMentions
+      ? {
+          "m.mentions": {
+            user_ids: mentionedUserIds,
+            room: rawMentions.room === true,
+          },
+        }
+      : {}),
+  };
+  const text = content.body ?? "";
+  return resolveMentions({
+    content,
+    userId: params.selfUserId,
+    displayName: params.displayName,
+    text,
+    mentionRegexes: params.mentionRegexes,
+  }).wasMentioned;
 }
 
 export function resolveMentions(params: {

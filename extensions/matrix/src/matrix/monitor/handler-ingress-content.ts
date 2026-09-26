@@ -1,4 +1,7 @@
-import { resolveInboundMentionDecision } from "openclaw/plugin-sdk/channel-inbound";
+import {
+  implicitMentionKindWhen,
+  resolveInboundMentionDecision,
+} from "openclaw/plugin-sdk/channel-inbound";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { formatAudioTranscriptForAgent } from "openclaw/plugin-sdk/media-understanding-runtime";
 import { buildInboundHistoryFromEntries } from "openclaw/plugin-sdk/reply-history";
@@ -20,7 +23,11 @@ import type {
 import { loadAcpBindingRuntime, loadSessionBindingRuntime } from "./handler-runtime.js";
 import type { MatrixHandlerRuntimeConfig } from "./handler-types.js";
 import { downloadMatrixMedia } from "./media.js";
-import { resolveMentions, stripMatrixMentionPrefix } from "./mentions.js";
+import {
+  isHumanAuthoredMentionedMatrixThreadRoot,
+  resolveMentions,
+  stripMatrixMentionPrefix,
+} from "./mentions.js";
 import {
   isMatrixAudioContent,
   resolveMatrixPreflightAudioTranscript,
@@ -297,6 +304,26 @@ export async function resolveMatrixIngressContent(config: {
           ? roomConfig?.requireMention
           : true
     : false;
+  let threadRootMentioned = false;
+  if (isRoom && shouldRequireMention && !wasMentioned && !isConfiguredBotSender && threadRootId) {
+    const threadRootEvent = await client.getEvent(roomId, threadRootId).catch((err: unknown) => {
+      logVerboseMessage(
+        `matrix: failed resolving thread root mention room=${roomId} id=${threadRootId}: ${String(err)}`,
+      );
+      return null;
+    });
+    if (threadRootEvent) {
+      const threadRootDisplayName =
+        selfDisplayName ?? (await getMemberDisplayName(roomId, selfUserId).catch(() => undefined));
+      threadRootMentioned = isHumanAuthoredMentionedMatrixThreadRoot({
+        event: threadRootEvent,
+        selfUserId,
+        configuredBotUserIds: handler.configuredBotUserIds,
+        displayName: threadRootDisplayName,
+        mentionRegexes: agentMentionRegexes,
+      });
+    }
+  }
   const mentionDecision = resolveInboundMentionDecision({
     facts: {
       // Matrix native mention metadata lets us reliably decide absence even
@@ -304,6 +331,9 @@ export async function resolveMatrixIngressContent(config: {
       canDetectMention: true,
       wasMentioned,
       hasAnyMention: hasExplicitMention,
+      // Re-read the authoritative thread root instead of keeping process-local
+      // activation state. This keeps continuation deterministic across restarts.
+      implicitMentionKinds: implicitMentionKindWhen("native", threadRootMentioned),
     },
     policy: {
       isGroup: isRoom,
