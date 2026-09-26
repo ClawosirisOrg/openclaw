@@ -230,7 +230,7 @@ describe("channel context builder caller inventory", () => {
     for (const [relativePath, marker] of HOST_BUILDERS) {
       expect(source(relativePath), relativePath).toContain(marker);
     }
-    expect(source("extensions/signal/src/monitor.ts")).toContain(
+    expect(source("extensions/signal/src/monitor.runtime.ts")).toContain(
       "channelRuntime: opts.channelRuntime",
     );
   });

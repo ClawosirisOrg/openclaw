@@ -62,9 +62,9 @@ import {
 type SignalSendFn = typeof import("./send.runtime.js").sendMessageSignal;
 type SignalProbe = import("./probe.js").SignalProbe;
 
-const loadSignalMonitorModule = createLazyRuntimeModule(() => import("./monitor.js"));
+const loadSignalMonitorModule = createLazyRuntimeModule(() => import("./monitor.runtime.js"));
 
-const loadSignalProbeModule = createLazyRuntimeModule(() => import("./probe.js"));
+const loadSignalProbeModule = createLazyRuntimeModule(() => import("./probe.runtime.js"));
 
 const loadSignalSendRuntime = createLazyRuntimeModule(() => import("./send.runtime.js"));
 
