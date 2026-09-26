@@ -337,7 +337,7 @@ vi.mock("./tools/in-process-gateway.js", () => ({
   callAgentToolGatewayRequest: (opts: unknown) => agentToolGatewayCallMock(opts),
   hasGatewayToolRoutingContext: () => false,
 }));
-vi.mock("../acp/runtime/session-meta.js", () => ({
+vi.mock("../acp/runtime/session-meta-readonly.js", () => ({
   readAcpSessionMetaForEntry: readAcpSessionMetaForEntryMock,
 }));
 vi.mock("../config/config.js", createConfigModuleMock);
