@@ -61,11 +61,11 @@ import {
 } from "./shared.js";
 
 type SignalSendFn = typeof import("./send.js").sendMessageSignal;
-type SignalProbe = import("./probe.js").SignalProbe;
+type SignalProbe = import("./probe.runtime.js").SignalProbe;
 
-const loadSignalMonitorModule = createLazyRuntimeModule(() => import("./monitor.js"));
+const loadSignalMonitorModule = createLazyRuntimeModule(() => import("./monitor.runtime.js"));
 
-const loadSignalProbeModule = createLazyRuntimeModule(() => import("./probe.js"));
+const loadSignalProbeModule = createLazyRuntimeModule(() => import("./probe.runtime.js"));
 
 const loadSignalSendRuntime = createLazyRuntimeModule(() => import("./send.js"));
 
